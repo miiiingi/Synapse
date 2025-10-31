@@ -26,7 +26,6 @@ from typing import Callable, Dict, Optional, Tuple, Union, List
 from tvm import relay, tir
 
 
-
 class BaseFXGraphImporter(metaclass=abc.ABCMeta):
     """Base class for FX Graph Importer."""
 
@@ -76,6 +75,69 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         dtype = BaseFXGraphImporter._convert_data_type(str(tensor.data.dtype))
         return relay.const(tensor.data.numpy(), dtype)
 
+    # @staticmethod
+    # def shape_of(tensor):
+    #     import torch
+    #     import tvm
+    #     from tvm import relay, tir
+
+    #     # ---- Case 1. PyTorch tensor ----
+    #     if isinstance(tensor, torch.Tensor):
+    #         return list(tensor.shape)
+
+    #     # ---- Case 2. Relay Expr ----
+    #     if isinstance(tensor, relay.Expr):
+    #         # 2-1) tensor를 타입추론 가능한 함수 본문으로 감싸고,
+    #         #      free vars를 전부 함수 파라미터로 승격시켜 바인딩합니다.
+    #         def infer_shape_from_expr(expr: relay.Expr):
+    #             # free vars 수집
+    #             fvs = relay.analysis.free_vars(expr)
+
+    #             # 파라미터 만들기: 가능한 한 기존 타입을 물려줌
+    #             params = []
+    #             subst_map = {}
+    #             for v in fvs:
+    #                 # v.checked_type 이 있으면 우선 사용, 없으면 v.type_annotation 시도
+    #                 ann = getattr(v, "checked_type", None) or getattr(v, "type_annotation", None)
+    #                 if ann is None:
+    #                     # 타입 정보가 전혀 없으면 타입 추론 불가 → 동적 처리로 반환
+    #                     return None
+    #                 nv = relay.Var(v.name_hint, ann)
+    #                 params.append(nv)
+    #                 subst_map[v] = nv
+
+    #             # 본문에 새 파라미터로 치환 적용
+    #             bound_body = relay.bind(expr, subst_map)
+
+    #             # identity 함수로 감싸서 body의 checked_type을 얻는다
+    #             func = relay.Function(params, bound_body)
+
+    #             mod = tvm.IRModule.from_expr(func)
+    #             mod = relay.transform.InferType()(mod)
+
+    #             body = mod["main"].body
+    #             cty = getattr(body, "checked_type", None)
+    #             if cty is None or not hasattr(cty, "shape"):
+    #                 return None
+
+    #             # shape 안의 각 항이 IntImm면 정수로 뽑고, 아니면 None (동적/심볼릭)
+    #             out = []
+    #             for d in cty.shape:
+    #                 if isinstance(d, tir.IntImm):
+    #                     out.append(int(d.value))
+    #                 else:
+    #                     # PrimExpr / Any 등: 정수로 못내림 → None로 표기
+    #                     out.append(None)
+    #             return out
+
+    #         shp = infer_shape_from_expr(tensor)
+    #         if shp is not None:
+    #             return shp
+
+    #         # 타입추론으로도 못 알아내면(완전 동적), 호출부가 처리하게 None 반환
+    #         return None
+
+    #     raise ValueError(f"Unsupported type for shape_of(): {type(tensor)}")
     @staticmethod
     def shape_of(tensor):
         """Get the shape of a tensor."""
@@ -107,7 +169,9 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
             return tensor.shape
         else:
             raise ValueError(f"Unsupported type: {type(tensor)}")
-            
+
+
+
     @staticmethod
     def _is_no_bias(bias):
         """Check if bias represents 'no bias' condition.
@@ -139,7 +203,7 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
                 raise ValueError("Cannot get shape from FX metadata")
         else:
             raise ValueError("Cannot find shape information")
-    
+
     def get_shape_weight(self, weight: relay.Var):
         import tvm
         from tvm import relay
@@ -183,6 +247,39 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         )
         assert not missing_func_types, f"Unsupported function types {missing_func_types}"
 
+    def _safe_get_dtype(self, val):
+        """입력 값(val)의 dtype을 안전하게 추출."""
+        from tvm import relay
+        import torch
+        import tvm
+
+        # Relay Constant → 내부 NDArray dtype 확인
+        if isinstance(val, relay.expr.Constant):
+            return str(val.data.dtype)
+
+        # Relay Var → checked_type에서 추출 (InferType 이후)
+        if isinstance(val, relay.Var):
+            try:
+                return val.checked_type.dtype
+            except Exception:
+                return "float32"
+
+        # torch.Tensor → torch dtype 문자열 변환
+        if isinstance(val, torch.Tensor):
+            return str(val.dtype).replace("torch.", "")
+
+        # TVM NDArray 직접 전달된 경우
+        if isinstance(val, tvm.nd.NDArray):
+            return str(val.dtype)
+
+        # Python 기본 타입
+        if isinstance(val, int):
+            return "float32"
+        if isinstance(val, float):
+            return "float32"
+
+        # fallback
+        return "float32"
     ########## Unary Ops ##########
 
     def _unary_op(self, op: Callable) -> Callable:
@@ -312,10 +409,26 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
 
         return self.block_builder.emit(relay.op.clip(x, a_min, a_max))
 
+    # def get_shape_relay_Var(self, node: torch.fx.Node):
+    #     from torch import fx as fx
+
+    #     x = self.env[node.args[0]]
+    #     fx_node = node.args[0]
+    #     if isinstance(fx_node, fx.Node) and 'val' in fx_node.meta:
+    #         tensor_meta = fx_node.meta['val']
+    #         if hasattr(tensor_meta, 'shape'):
+    #             x_shape = tensor_meta.shape
+    #             dtype = str(tensor_meta.dtype).replace('torch.', '')
+    #             return (x, x_shape, dtype)
+    #         else:
+    #             raise ValueError("Cannot get shape from FX metadata")
+    #     else:
+    #         raise ValueError("Cannot find shape information")
+
     def _elu(self, node: fx.Node) -> relay.Var:
         x = self.env[node.args[0]]
+        _, _, dtype = self.get_shape_relay_Var(node)
         alpha = node.args[1] if len(node.args) > 1 else node.kwargs.get("alpha", 1.0)
-        dtype = x.struct_info.dtype
 
         if isinstance(alpha, (int, float)):
             alpha = relay.const(-alpha, dtype)
@@ -451,37 +564,43 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         return convert
 
     ########## Binary Ops ##########
-
     def _binary_op(self, relay_op: Callable, intrinsic_op: Callable) -> Callable:
         from torch import fx
+        from tvm import relay
 
         def convert(node: fx.Node) -> relay.Var:
-            def promote_binary_op_args(lhs, rhs):
-                if isinstance(lhs, relay.Expr) and isinstance(rhs, relay.Expr):
-                    return lhs, rhs
-                elif isinstance(lhs, relay.Expr):
-                    assert isinstance(lhs.struct_info, relay.TensorStructInfo)
-                    return lhs, relay.const(rhs, lhs.struct_info.dtype)
-                elif isinstance(rhs, relay.Expr):
-                    assert isinstance(rhs.struct_info, relay.TensorStructInfo)
-                    return relay.const(lhs, rhs.struct_info.dtype), rhs
-                else:
-                    assert False
-
-            def call_binary_op(op, lhs, rhs):
-                lhs, rhs = promote_binary_op_args(lhs, rhs)
-                return self.block_builder.emit(op(lhs, rhs))
-
             lhs, rhs = self.retrieve_args(node)
-            if isinstance(lhs, relay.Var) or isinstance(rhs, relay.Var):
-                return call_binary_op(relay_op, lhs, rhs)
-            elif isinstance(lhs, relay.expr.Constant):
-                return call_binary_op(relay_op, lhs, relay.const(rhs, dtype=lhs.struct_info.dtype))
-            elif isinstance(rhs, relay.expr.Constant):
-                return call_binary_op(relay_op, relay.const(lhs, dtype=rhs.struct_info.dtype), rhs)
-            return intrinsic_op(lhs, rhs)
+
+            # 🔹 1. Python 기본형 → relay.const 변환
+            if isinstance(lhs, (int, float)):
+                lhs = relay.const(float(lhs), dtype="float32")  # ✅ 강제 float 변환
+            if isinstance(rhs, (int, float)):
+                rhs = relay.const(float(rhs), dtype="float32")  # ✅ 강제 float 변환
+
+            # 🔹 2. dtype 추출
+            lhs_dtype = self._safe_get_dtype(lhs)
+            rhs_dtype = self._safe_get_dtype(rhs)
+
+            # 🔹 3. dtype mismatch 시 통일
+            common_dtype = "float32"
+            if lhs_dtype == rhs_dtype:
+                common_dtype = lhs_dtype
+            elif "float" in lhs_dtype or "float" in rhs_dtype:
+                common_dtype = "float32"
+            elif "int" in lhs_dtype or "int" in rhs_dtype:
+                common_dtype = "float32"  # ✅ int도 float32로 통일
+
+            # 🔹 4. Constant → dtype 맞추기
+            if isinstance(lhs, relay.expr.Constant) and str(lhs.data.dtype) != common_dtype:
+                lhs = relay.const(lhs.data.asnumpy().astype(common_dtype), dtype=common_dtype)
+            if isinstance(rhs, relay.expr.Constant) and str(rhs.data.dtype) != common_dtype:
+                rhs = relay.const(rhs.data.asnumpy().astype(common_dtype), dtype=common_dtype)
+
+            # 🔹 5. Relay 연산 적용
+            return self.block_builder.emit(relay_op(lhs, rhs))
 
         return convert
+
 
     def _div(self, node: fx.Node) -> relay.Var:
         args = self.retrieve_args(node)
@@ -985,7 +1104,7 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
 
         if self._is_no_bias(bias):
             return conv2d
-        
+
         assert len(self.shape_of(bias)) == 1
         bias = relay.op.reshape(bias, (1, -1, 1, 1))
         return self.block_builder.emit(relay.op.add(conv2d, bias))
@@ -1306,14 +1425,19 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
 
         # Calculate symmetric padding width for each dimension
         # and applying them in reverse order to match the input dimensions.
-        input_ndim = x.struct_info.ndim
-        pad_width = [0] * (input_ndim * 2)
+        _, x_shape, _ = self.get_shape_relay_Var(node)
+        input_ndim = len(x_shape)
+        # pad가 1D 리스트인 경우, (left, right, top, bottom, ...) 형식으로 가정
+        # 이를 2D 리스트로 변환
         pad_pairs = [pad[i : i + 2] for i in range(0, len(pad), 2)]
-        reversed_pairs = list(reversed(pad_pairs))
-        flattened = [value for pair in reversed_pairs for value in pair]
-        pad_width[-len(flattened) :] = flattened
 
-        return self.block_builder.emit(relay.op.nn.pad(x, pad_width, mode, value))
+        # input_ndim과 pad 차원이 다를 수 있으므로 앞쪽에 (0,0) 채움
+        pad_pairs = [[0, 0]] * (input_ndim - len(pad_pairs)) + pad_pairs
+
+        # TVM expects [[before, after], [before, after], ...]
+        pad_width = [[int(p[0]), int(p[1])] for p in pad_pairs]
+
+        return self.block_builder.emit(relay.op.nn.pad(x, pad_width, value, mode))
 
     def _pixel_shuffle(self, node: fx.Node) -> relay.Var:
         data = self.env[node.args[0]]
@@ -1485,7 +1609,7 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
     def _cat(self, node: fx.Node) -> relay.Var:
         args = self.retrieve_args(node)
         axis = args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
-        return self.block_builder.emit(relay.op.concat(args[0], axis=axis))
+        return self.block_builder.emit(relay.op.concatenate(args[0], axis=axis))
 
     def _chunk(self, node: fx.Node) -> relay.Var:
         x = self.env[node.args[0]]
@@ -2172,7 +2296,6 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         self,
     ) -> Dict[Union[torch.nn.Module, str], Callable[[fx.Node], relay.Var]]:
         """Create convert map"""
-
 
     ######## custom operator #########
     def _assert_scalar(self, node: fx.Node) -> relay.Var:

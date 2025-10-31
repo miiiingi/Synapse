@@ -249,31 +249,42 @@ class ExportedProgramImporter(BaseFXGraphImporter):
     def _upsample_impl(
         self,
         x: relay.Expr,
+        node: fx.Node,
         size,
         scale_factor,
         method: str,
         align_corners: bool,
     ) -> relay.Var:
         coord_trans = "align_corners" if align_corners else "half_pixel"
+        _, x_shape, _ = self.get_shape_relay_Var(node)
 
-        if size is None:
-            shape = self.shape_of(x)
-            assert isinstance(shape, relay.ShapeExpr)
-            if isinstance(scale_factor, (tuple, list)):
-                assert len(scale_factor) == len(shape) - 2
-                size = tuple(
-                    int(shape[i].value * scale_factor[i - 2])
-                    for i in range(2, len(shape))
+        # 🔹 size 계산 (조건문 제거, 직접 계산)
+        if size is None and scale_factor is not None:
+            # scale_factor를 미리 평가하여 조건문 제거
+            try:
+                # scale_factor가 스칼라인지 확인
+                sf_h = (
+                    scale_factor[0]
+                    if hasattr(scale_factor, "__getitem__")
+                    else scale_factor
                 )
-            else:
-                size = tuple(
-                    int(shape[i].value * scale_factor) for i in range(2, len(shape))
+                sf_w = (
+                    scale_factor[1]
+                    if hasattr(scale_factor, "__getitem__") and len(scale_factor) > 1
+                    else sf_h
                 )
+            except (TypeError, IndexError):
+                # scale_factor가 스칼라인 경우
+                sf_h = sf_w = scale_factor
+
+            out_h = int(x_shape[2] * sf_h)
+            out_w = int(x_shape[3] * sf_w)
+            size = (out_h, out_w)
 
         return self.block_builder.emit(
             relay.op.image.resize2d(
                 x,
-                size,
+                size=size,
                 layout="NCHW",
                 method=method,
                 coordinate_transformation_mode=coord_trans,
@@ -293,6 +304,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         )
         return self._upsample_impl(
             x,
+            node,
             size=size,
             scale_factor=scale_factor,
             method="linear",
@@ -328,6 +340,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
         return self._upsample_impl(
             x,
+            node,
             size=size,
             scale_factor=scale_factor,
             method="nearest_neighbor",
@@ -357,6 +370,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
         return self._upsample_impl(
             x,
+            node,
             size=size,
             scale_factor=scale_factor,
             method="cubic",
@@ -1017,6 +1031,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "floor.default": self._unary_op(relay.op.floor),
             "gelu.default": self._gelu,
             "hardsigmoid.default": self._hardsigmoid,
+            "sigmoid.default": self._unary_op(relay.op.sigmoid),
             "hardswish.default": self._hardswish,
             "hardswish_.default": self._hardswish,
             "hardtanh.default": self._hardtanh,
@@ -1082,6 +1097,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "min.default": self._unary_op(relay.op.min),
             "remainder.Tensor": self._binary_op(relay.op.floor_mod, operator.mod),
             "remainder.Scalar": self._binary_op(relay.op.floor_mod, operator.mod),
+            "mul": self._binary_op(relay.op.multiply, operator.mul),
             "mul.default": self._binary_op(relay.op.multiply, operator.mul),
             "mul.Scalar": self._binary_op(relay.op.multiply, operator.mul),
             "mul.Tensor": self._binary_op(relay.op.multiply, operator.mul),
@@ -1237,6 +1253,8 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             # other
             "getitem": self._getitem,
             "item.default": self._item,
+            "sym_size.int": lambda node: relay.const(1),
+            "_assert_scalar.default": lambda node: self.env[node.args[0]],
         }
 
     def build_relay_function_from_fx(
@@ -1333,6 +1351,8 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         return func
 
     def torch_to_tvm_fp32(self, t: torch.Tensor) -> tvm.nd.NDArray:
+        import numpy as np
+
         """
         Torch Tensor -> tvm.nd.NDArray (float64를 float32로 내림, DLPack 사용, 안전 fallback 포함)
         """
@@ -1495,7 +1515,6 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
         # 0.11 계열은 BindParams 패스가 없으므로 함수 단위 바인딩
         mod["main"] = bind_params_by_name(mod["main"], binding)
-
         mod = relay.transform.InferType()(mod)
 
         if keep_params_as_input:
