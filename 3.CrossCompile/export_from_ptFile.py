@@ -5,6 +5,64 @@ import torch
 import tvm
 from tvm import relay
 
+
+def check_optimization_applied(lib, name="model", OPT_LEVEL=0):
+    import json
+    """
+    build된 library에서 최적화 여부 확인
+    """
+    print("=" * 80)
+    print(f"Optimization Check for {name}, OPT_LEVEL = {OPT_LEVEL}")
+    print("=" * 80)
+
+    # Graph JSON 가져오기
+    graph_json = json.loads(lib.get_graph_json())
+    nodes = graph_json["nodes"]
+
+    # 1. Fused operation 찾기
+    fused_ops = [n for n in nodes if "fused" in n.get("name", "").lower()]
+    total_ops = [n for n in nodes if n.get("op") != "null"]
+
+    print(f"\n?? Statistics:")
+    print(f"  Total nodes: {len(nodes)}")
+    print(f"  Compute operations: {len(total_ops)}")
+    print(f"  Fused operations: {len(fused_ops)}")
+
+    # 2. Fusion 여부 판단
+    if len(fused_ops) > 0:
+        print(f"\n? OPERATOR FUSION: APPLIED")
+        print(f"   Found {len(fused_ops)} fused operations")
+        print(f"\n   Sample fused operations:")
+        for i, op in enumerate(fused_ops[:5], 1):
+            print(f"     {i}. {op['name']}")
+    else:
+        print(f"\n? OPERATOR FUSION: NOT APPLIED")
+        print(f"   No fused operations found")
+
+    # 3. Constant folding 간접 확인
+    # 상수 노드 개수 확인
+    const_nodes = [n for n in nodes if n.get("op") == "const"]
+    print(f"\n?? Constant nodes: {len(const_nodes)}")
+
+    # 4. 노드 타입 분포
+    node_types = {}
+    for node in nodes:
+        op = node.get("op", "unknown")
+        node_types[op] = node_types.get(op, 0) + 1
+
+    print(f"\n?? Node type distribution:")
+    for op_type, count in sorted(node_types.items()):
+        print(f"   {op_type}: {count}")
+
+    return {
+        "total_nodes": len(nodes),
+        "compute_ops": len(total_ops),
+        "fused_ops": len(fused_ops),
+        "const_nodes": len(const_nodes),
+        "fusion_applied": len(fused_ops) > 0,
+    }
+
+
 # --------- CLI ---------
 p = argparse.ArgumentParser()
 p.add_argument("--encoder-pt", required=True)
@@ -20,6 +78,7 @@ DECODER_PT = args.decoder_pt
 H, W = args.height, args.width
 TARGET = tvm.target.Target(args.target)
 OUTDIR = args.outdir
+OPT_LEVEL = 3
 os.makedirs(OUTDIR, exist_ok=True)
 
 
@@ -57,8 +116,27 @@ print("Converting encoder to Relay IR...")
 mod_enc, params_enc = relay.frontend.from_pytorch(enc_mod, [("input_0", dummy.shape)])
 
 print("Building encoder for TVM...")
-lib_enc = relay.build(mod_enc, target=TARGET, params=params_enc)
-export_tvm_module(lib_enc, "encoder_deploy")
+# # build 전 최적화된 Relay IR 확인
+# with tvm.transform.PassContext(opt_level=3):
+#     mod_enc = relay.transform.InferType()(mod_enc)
+#     mod_enc = relay.transform.FoldConstant()(mod_enc)
+#     mod_enc = relay.transform.FuseOps()(mod_enc)  # Fusion pass 명시적 적용
+
+#     # 최적화 후 IR 출력
+#     print("=" * 80)
+#     print("After Fusion:")
+#     print("=" * 80)
+#     print(mod_enc)
+
+#     # IR을 파일로 저장
+#     with open(os.path.join(OUTDIR, "encoder_fused_ir.txt"), "w") as f:
+#         f.write(str(mod_enc))
+
+with tvm.transform.PassContext(opt_level=OPT_LEVEL):
+    lib_enc = relay.build(mod_enc, target=TARGET, params=params_enc)
+enc_results = check_optimization_applied(lib_enc, "Encoder", OPT_LEVEL)
+print(f'enc results: {enc_results}')
+export_tvm_module(lib_enc, f"encoder_deploy_{OPT_LEVEL}")
 
 
 def try_call_decoder(dec, feats):
@@ -111,8 +189,11 @@ with torch.no_grad():
     mod_dec, params_dec = relay.frontend.from_pytorch(traced_adapter, input_list)
 
 print("Building decoder for TVM...")
-lib_dec = relay.build(mod_dec, target=TARGET, params=params_dec)
-export_tvm_module(lib_dec, "decoder_deploy")
+with tvm.transform.PassContext(opt_level=OPT_LEVEL):
+    lib_dec = relay.build(mod_dec, target=TARGET, params=params_dec)
+dec_results = check_optimization_applied(lib_dec, "Decoder", OPT_LEVEL)
+print(f'dec results: {dec_results}')
+export_tvm_module(lib_dec, f"decoder_deploy_{OPT_LEVEL}")
 
 
 print("\n✅ Done. Files are in:", OUTDIR)
