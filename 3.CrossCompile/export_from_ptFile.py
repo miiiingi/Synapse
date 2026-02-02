@@ -116,22 +116,6 @@ print("Converting encoder to Relay IR...")
 mod_enc, params_enc = relay.frontend.from_pytorch(enc_mod, [("input_0", dummy.shape)])
 
 print("Building encoder for TVM...")
-# # build 전 최적화된 Relay IR 확인
-# with tvm.transform.PassContext(opt_level=3):
-#     mod_enc = relay.transform.InferType()(mod_enc)
-#     mod_enc = relay.transform.FoldConstant()(mod_enc)
-#     mod_enc = relay.transform.FuseOps()(mod_enc)  # Fusion pass 명시적 적용
-
-#     # 최적화 후 IR 출력
-#     print("=" * 80)
-#     print("After Fusion:")
-#     print("=" * 80)
-#     print(mod_enc)
-
-#     # IR을 파일로 저장
-#     with open(os.path.join(OUTDIR, "encoder_fused_ir.txt"), "w") as f:
-#         f.write(str(mod_enc))
-
 with tvm.transform.PassContext(opt_level=OPT_LEVEL):
     lib_enc = relay.build(mod_enc, target=TARGET, params=params_enc)
 enc_results = check_optimization_applied(lib_enc, "Encoder", OPT_LEVEL)
