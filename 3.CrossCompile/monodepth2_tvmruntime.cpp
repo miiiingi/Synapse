@@ -274,7 +274,9 @@ public:
 
         size_t current_idx = 0;
         bool playing = false;
-        auto start = std::chrono::high_resolution_clock::now();
+        bool timing_started = false;
+        size_t timed_frames = 0;
+        std::chrono::high_resolution_clock::time_point start, end;
 
         while (current_idx < image_files.size()) {
             std::cout << "Processing: " << image_files[current_idx]
@@ -290,12 +292,22 @@ public:
             auto [depth_map, colorized] = processImage(image);
             visualize(image, depth_map, colorized);
 
+            // ✅ playing 상태에서만 프레임 카운트
+            if (playing && timing_started) {
+                timed_frames++;
+            }
+
             int key = cv::waitKey(playing ? 30 : 0);
 
             if (key == 27) { // ESC
                 break;
             } else if (key == 32) { // SPACE
                 playing = !playing;
+                // ✅ Playing이 처음 시작되는 순간
+                if (playing && !timing_started) {
+                    timing_started = true;
+                    start = std::chrono::high_resolution_clock::now();
+                }
                 std::cout << (playing ? "Playing" : "Paused") << std::endl;
             } else if (key == 83 || key == 115) { // 'S' or 's' - save
                 std::string save_name = "depth_" + std::to_string(current_idx) + ".png";
@@ -311,10 +323,14 @@ public:
                 current_idx++;
             }
         }
+        if (timing_started && timed_frames > 0) {
+            end = std::chrono::high_resolution_clock::now();
+            auto duration =
+                std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        std::cout << "Average Processing time: " << duration.count() / (current_idx + 1) << "ms\n";
+            std::cout << "Average Processing time (Playing only): "
+                    << duration.count() / timed_frames << " ms\n";
+        }
     }
 
     DLDataType getDLDataType(const torch::Tensor& t) {
