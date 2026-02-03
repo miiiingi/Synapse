@@ -8,6 +8,7 @@ from tvm import relay
 
 def check_optimization_applied(lib, name="model", OPT_LEVEL=0):
     import json
+
     """
     build된 library에서 최적화 여부 확인
     """
@@ -69,7 +70,11 @@ p.add_argument("--encoder-pt", required=True)
 p.add_argument("--decoder-pt", required=True)
 p.add_argument("--height", type=int, default=192)
 p.add_argument("--width", type=int, default=640)
-p.add_argument("--target", type=str, default="llvm -mtriple=aarch64-linux-gnu")
+p.add_argument(
+    "--target",
+    type=str,
+    default="llvm -mtriple=aarch64-linux-gnu -mcpu=cortex-a72 -mattr=+neon",
+)
 p.add_argument("--outdir", type=str, default="tvm_model")
 args = p.parse_args()
 
@@ -119,7 +124,7 @@ print("Building encoder for TVM...")
 with tvm.transform.PassContext(opt_level=OPT_LEVEL):
     lib_enc = relay.build(mod_enc, target=TARGET, params=params_enc)
 enc_results = check_optimization_applied(lib_enc, "Encoder", OPT_LEVEL)
-print(f'enc results: {enc_results}')
+print(f"enc results: {enc_results}")
 export_tvm_module(lib_enc, f"encoder_deploy_{OPT_LEVEL}")
 
 
@@ -176,7 +181,7 @@ print("Building decoder for TVM...")
 with tvm.transform.PassContext(opt_level=OPT_LEVEL):
     lib_dec = relay.build(mod_dec, target=TARGET, params=params_dec)
 dec_results = check_optimization_applied(lib_dec, "Decoder", OPT_LEVEL)
-print(f'dec results: {dec_results}')
+print(f"dec results: {dec_results}")
 export_tvm_module(lib_dec, f"decoder_deploy_{OPT_LEVEL}")
 
 
