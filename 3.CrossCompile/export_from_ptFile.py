@@ -4,6 +4,99 @@ import sys
 import torch
 import tvm
 from tvm import relay
+from tvm.tir import stmt_functor
+
+
+@tvm.tir.transform.prim_func_pass(opt_level=0)
+def ForceSmallLoopUnroll(func, mod, ctx):
+    def _has_inner_for(stmt):
+        found = False
+
+        def _v(s):
+            nonlocal found
+            if isinstance(s, tvm.tir.For):
+                found = True
+
+        stmt_functor.post_order_visit(stmt, _v)
+        return found
+
+    def _post(stmt):
+        if isinstance(stmt, tvm.tir.For):
+            # 너무 공격적인 unroll 방지:
+            # - SERIAL only
+            # - 정수 상수 extent
+            # - 아주 작은 loop만(<=4)
+            # - innermost loop만
+            if (
+                stmt.kind == tvm.tir.ForKind.SERIAL
+                and isinstance(stmt.extent, tvm.tir.IntImm)
+                and int(stmt.extent) <= 4
+                and not _has_inner_for(stmt.body)
+            ):
+                return tvm.tir.For(
+                    stmt.loop_var,
+                    stmt.min,
+                    stmt.extent,
+                    tvm.tir.ForKind.UNROLLED,
+                    stmt.body,
+                    stmt.thread_binding,
+                    stmt.annotations,
+                    stmt.span,
+                )
+        return stmt
+
+    new_body = stmt_functor.ir_transform(func.body, None, _post, ["tir.For"])
+    return func.with_body(new_body)
+
+
+@tvm.instrument.pass_instrument
+class CheckUnrollInstrument:
+    def __init__(self):
+        self.before_unroll = None
+
+    def _collect(self, mod):
+        stats = {"primfuncs": 0, "for_total": 0, "for_unrolled": 0, "small_serial": 0}
+
+        def _visit(stmt):
+            if isinstance(stmt, tvm.tir.For):
+                stats["for_total"] += 1
+                if stmt.kind == tvm.tir.ForKind.UNROLLED:
+                    stats["for_unrolled"] += 1
+                if (
+                    stmt.kind == tvm.tir.ForKind.SERIAL
+                    and isinstance(stmt.extent, tvm.tir.IntImm)
+                    and int(stmt.extent) <= 8
+                ):
+                    stats["small_serial"] += 1
+
+        for _, f in mod.functions.items():
+            if isinstance(f, tvm.tir.PrimFunc):
+                stats["primfuncs"] += 1
+                stmt_functor.post_order_visit(f.body, _visit)
+        return stats
+
+    def run_before_pass(self, mod, info):
+        if "UnrollLoop" in info.name:
+            self.before_unroll = self._collect(mod)
+
+    def run_after_pass(self, mod, info):
+        if "ForceSmallLoopUnroll" in info.name:
+            s = self._collect(mod)
+            print(
+                f"[TIR CHECK] after {info.name}: "
+                f"primfuncs={s['primfuncs']}, for_unrolled={s['for_unrolled']}, "
+                f"small_serial={s['small_serial']}"
+            )
+            return
+
+        if "UnrollLoop" in info.name:
+            a = self._collect(mod)
+            b = self.before_unroll
+            print(
+                f"[TIR CHECK] after {info.name}: "
+                f"before(unrolled={b['for_unrolled'] if b else -1}, total={b['for_total'] if b else -1}) -> "
+                f"after(unrolled={a['for_unrolled']}, total={a['for_total']})"
+            )
 
 
 def check_optimization_applied(lib, name="model", OPT_LEVEL=0):
@@ -84,6 +177,7 @@ H, W = args.height, args.width
 TARGET = tvm.target.Target(args.target)
 OUTDIR = args.outdir
 OPT_LEVEL = 3
+UNROLL_PHASE = 3
 os.makedirs(OUTDIR, exist_ok=True)
 
 
@@ -120,12 +214,20 @@ else:
 print("Converting encoder to Relay IR...")
 mod_enc, params_enc = relay.frontend.from_pytorch(enc_mod, [("input_0", dummy.shape)])
 
-print("Building encoder for TVM...")
-with tvm.transform.PassContext(opt_level=OPT_LEVEL):
+with tvm.transform.PassContext(
+    opt_level=OPT_LEVEL,
+    config={
+        "tir.add_lower_pass": [
+            (UNROLL_PHASE, ForceSmallLoopUnroll),
+            (UNROLL_PHASE, tvm.tir.transform.UnrollLoop()),
+        ],
+    },
+    instruments=[CheckUnrollInstrument()],
+):
     lib_enc = relay.build(mod_enc, target=TARGET, params=params_enc)
-enc_results = check_optimization_applied(lib_enc, "Encoder", OPT_LEVEL)
-print(f"enc results: {enc_results}")
-export_tvm_module(lib_enc, f"encoder_deploy_{OPT_LEVEL}")
+
+# enc_results = check_optimization_applied(lib_enc, "Encoder", OPT_LEVEL)
+export_tvm_module(lib_enc, f"encoder_deploy_{OPT_LEVEL}_unroll_{UNROLL_PHASE}")
 
 
 def try_call_decoder(dec, feats):
@@ -178,13 +280,21 @@ with torch.no_grad():
     mod_dec, params_dec = relay.frontend.from_pytorch(traced_adapter, input_list)
 
 print("Building decoder for TVM...")
-with tvm.transform.PassContext(opt_level=OPT_LEVEL):
+
+with tvm.transform.PassContext(
+    opt_level=OPT_LEVEL,
+    config={
+        "tir.add_lower_pass": [
+            (UNROLL_PHASE, ForceSmallLoopUnroll),
+            (UNROLL_PHASE, tvm.tir.transform.UnrollLoop()),
+        ],
+    },
+    instruments=[CheckUnrollInstrument()],
+):
     lib_dec = relay.build(mod_dec, target=TARGET, params=params_dec)
-dec_results = check_optimization_applied(lib_dec, "Decoder", OPT_LEVEL)
-print(f"dec results: {dec_results}")
-export_tvm_module(lib_dec, f"decoder_deploy_{OPT_LEVEL}")
+
+# dec_results = check_optimization_applied(lib_dec, "Decoder", OPT_LEVEL)
+export_tvm_module(lib_dec, f"decoder_deploy_{OPT_LEVEL}_unroll_{UNROLL_PHASE}")
 
 
 print("\n✅ Done. Files are in:", OUTDIR)
-print("   - encoder_deploy.so/.json/.params")
-print("   - decoder_deploy.so/.json/.params")
