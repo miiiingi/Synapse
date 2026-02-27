@@ -4,6 +4,7 @@ import sys
 import torch
 import tvm
 from tvm import relay
+from tvm import auto_scheduler
 from tvm.tir import stmt_functor
 
 
@@ -157,144 +158,218 @@ def check_optimization_applied(lib, name="model", OPT_LEVEL=0):
     }
 
 
-# --------- CLI ---------
-p = argparse.ArgumentParser()
-p.add_argument("--encoder-pt", required=True)
-p.add_argument("--decoder-pt", required=True)
-p.add_argument("--height", type=int, default=192)
-p.add_argument("--width", type=int, default=640)
-p.add_argument(
-    "--target",
-    type=str,
-    default="llvm -mtriple=aarch64-linux-gnu -mcpu=cortex-a72 -mattr=+neon",
-)
-p.add_argument("--outdir", type=str, default="tvm_model")
-args = p.parse_args()
-
-ENCODER_PT = args.encoder_pt
-DECODER_PT = args.decoder_pt
-H, W = args.height, args.width
-TARGET = tvm.target.Target(args.target)
-OUTDIR = args.outdir
-OPT_LEVEL = 3
-UNROLL_PHASE = 3
-os.makedirs(OUTDIR, exist_ok=True)
-
-
-def export_tvm_module(lib, name):
+def export_tvm_module(lib, name, OUTDIR, TARGET):
     so = os.path.join(OUTDIR, f"{name}.so")
     js = os.path.join(OUTDIR, f"{name}.json")
     pr = os.path.join(OUTDIR, f"{name}.params")
-    lib.export_library(so, cc="aarch64-linux-gnu-g++")
+
+    # If target is 'c', export as .c file instead of .so
+    if str(TARGET.kind) == "c":
+        c_file = os.path.join(OUTDIR, f"{name}.c")
+        lib.export_library(c_file)
+        print(f"[OK] Exported Standalone C: {c_file}")
+    else:
+        lib.export_library(so, cc="aarch64-linux-gnu-g++")
+        print(f"[OK] Exported Shared Library: {so}")
+
     with open(js, "w") as f:
         f.write(lib.get_graph_json())
     with open(pr, "wb") as f:
         f.write(relay.save_param_dict(lib.get_params()))
-    print(f"[OK] Exported: {so}, {js}, {pr}")
+    print(f"[OK] Exported: {js}, {pr}")
 
 
-print("Loading TorchScript models...")
-encoder = torch.jit.load(ENCODER_PT, map_location="cpu").eval()
-decoder = torch.jit.load(DECODER_PT, map_location="cpu").eval()
+def tune_network(mod, params, target, log_file):
+    print(f"Extracting tasks for Auto-Scheduler (Target: {target})...")
+    tasks, task_weights = auto_scheduler.extract_tasks(mod["main"], params, target)
 
-dummy = torch.randn(1, 3, H, W)
+    for idx, task in enumerate(tasks):
+        print(f"========== Task {idx}  (workload key: {task.workload_key}) ==========")
+        print(task.compute_dag)
 
-with torch.no_grad():
-    enc_mod = encoder
-    print("Running encoder once to get actual feature shapes...")
-    enc_out = enc_mod(dummy)
+    print("Begin tuning...")
+    tuner = auto_scheduler.TaskScheduler(tasks, task_weights)
 
-if isinstance(enc_out, torch.Tensor):
-    enc_feats = [enc_out]
-elif isinstance(enc_out, (list, tuple)):
-    enc_feats = list(enc_out)
-else:
-    raise RuntimeError(f"Unsupported encoder output type: {type(enc_out)}")
+    # Note: For target="c" (Standalone C) on a custom board, you would need a custom builder/runner here.
+    # This example uses LocalRunner for demonstration, which runs on the host.
+    # To run on aarch64 board, you need RPCRunner.
+    tune_option = auto_scheduler.TuningOptions(
+        num_measure_trials=200,  # Increase this for better results (e.g., 20000)
+        runner=auto_scheduler.LocalRunner(repeat=1, number=10, timeout=4),
+        measure_callbacks=[auto_scheduler.RecordToFile(log_file)],
+    )
 
-print("Converting encoder to Relay IR...")
-mod_enc, params_enc = relay.frontend.from_pytorch(enc_mod, [("input_0", dummy.shape)])
-
-with tvm.transform.PassContext(
-    opt_level=OPT_LEVEL,
-    config={
-        "tir.add_lower_pass": [
-            (UNROLL_PHASE, ForceSmallLoopUnroll),
-            (UNROLL_PHASE, tvm.tir.transform.UnrollLoop()),
-        ],
-    },
-    instruments=[CheckUnrollInstrument()],
-):
-    lib_enc = relay.build(mod_enc, target=TARGET, params=params_enc)
-
-# enc_results = check_optimization_applied(lib_enc, "Encoder", OPT_LEVEL)
-export_tvm_module(lib_enc, f"encoder_deploy_{OPT_LEVEL}_unroll_{UNROLL_PHASE}")
+    tuner.tune(tune_option)
+    print("Tuning completed.")
 
 
-def try_call_decoder(dec, feats):
+def main():
+    # --------- CLI ---------
+    p = argparse.ArgumentParser()
+    p.add_argument("--encoder-pt", required=True)
+    p.add_argument("--decoder-pt", required=True)
+    p.add_argument("--height", type=int, default=192)
+    p.add_argument("--width", type=int, default=640)
+    p.add_argument(
+        "--target",
+        type=str,
+        default="llvm -mtriple=aarch64-linux-gnu -mcpu=cortex-a72 -mattr=+neon",
+    )
+    p.add_argument("--outdir", type=str, default="tvm_model")
+    p.add_argument("--tune", action="store_true", help="Run Auto-Scheduler tuning")
+    p.add_argument(
+        "--tune-log",
+        type=str,
+        default="tuning_log.json",
+        help="Path to tuning log file",
+    )
+    args = p.parse_args()
+
+    ENCODER_PT = args.encoder_pt
+    DECODER_PT = args.decoder_pt
+    H, W = args.height, args.width
+    TARGET = tvm.target.Target(args.target)
+    OUTDIR = args.outdir
+    TUNE = args.tune
+    TUNE_LOG = args.tune_log
+    OPT_LEVEL = 3
+    UNROLL_PHASE = 3
+    os.makedirs(OUTDIR, exist_ok=True)
+
+    print("Loading TorchScript models...")
+    encoder = torch.jit.load(ENCODER_PT, map_location="cpu").eval()
+    decoder = torch.jit.load(DECODER_PT, map_location="cpu").eval()
+
+    dummy = torch.randn(1, 3, H, W)
+
     with torch.no_grad():
-        try:
-            _ = dec(*feats)
-            return "varargs"
-        except Exception:
-            pass
-        try:
-            _ = dec(feats)
-            return "list"
-        except Exception as e:
-            raise RuntimeError(
-                f"Decoder doesn't accept either varargs or list. " f"Last error: {e}"
-            )
+        enc_mod = encoder
+        print("Running encoder once to get actual feature shapes...")
+        enc_out = enc_mod(dummy)
+
+    if isinstance(enc_out, torch.Tensor):
+        enc_feats = [enc_out]
+    elif isinstance(enc_out, (list, tuple)):
+        enc_feats = list(enc_out)
+    else:
+        raise RuntimeError(f"Unsupported encoder output type: {type(enc_out)}")
+
+    print("Converting encoder to Relay IR...")
+    mod_enc, params_enc = relay.frontend.from_pytorch(
+        enc_mod, [("input_0", dummy.shape)]
+    )
+
+    if TUNE:
+        tune_network(mod_enc, params_enc, TARGET, f"encoder_{TUNE_LOG}")
+
+    print("Building encoder for TVM...")
+    # Apply tuning log if it exists
+    if os.path.exists(f"encoder_{TUNE_LOG}"):
+        print(f"Applying tuning log: encoder_{TUNE_LOG}")
+        with auto_scheduler.ApplyHistoryBest(f"encoder_{TUNE_LOG}"):
+            with tvm.transform.PassContext(
+                opt_level=OPT_LEVEL,
+                # Auto-Scheduler가 스케줄링을 담당하므로 수동 Unroll 패스 제거
+            ):
+                lib_enc = relay.build(mod_enc, target=TARGET, params=params_enc)
+    else:
+        with tvm.transform.PassContext(
+            opt_level=OPT_LEVEL,
+            config={
+                "tir.add_lower_pass": [
+                    (UNROLL_PHASE, ForceSmallLoopUnroll),
+                    (UNROLL_PHASE, tvm.tir.transform.UnrollLoop()),
+                ],
+            },
+            instruments=[CheckUnrollInstrument()],
+        ):
+            lib_enc = relay.build(mod_enc, target=TARGET, params=params_enc)
+
+    # enc_results = check_optimization_applied(lib_enc, "Encoder", OPT_LEVEL)
+    export_tvm_module(
+        lib_enc, f"encoder_deploy_{OPT_LEVEL}_unroll_{UNROLL_PHASE}", OUTDIR, TARGET
+    )
+
+    def try_call_decoder(dec, feats):
+        with torch.no_grad():
+            try:
+                _ = dec(*feats)
+                return "varargs"
+            except Exception:
+                pass
+            try:
+                _ = dec(feats)
+                return "list"
+            except Exception as e:
+                raise RuntimeError(
+                    f"Decoder doesn't accept either varargs or list. "
+                    f"Last error: {e}"
+                )
+
+    mode = try_call_decoder(decoder, enc_feats)
+
+    class DecoderAdapter(torch.nn.Module):
+        def __init__(self, dec, mode):
+            super().__init__()
+            self.dec = dec
+            self.mode = mode
+
+        def forward(self, *feats):
+            if self.mode == "varargs":
+                return self.dec(*feats)
+            else:  # "list"
+                return self.dec(list(feats))
+
+    adapter = DecoderAdapter(decoder, mode).eval()
+
+    sample_feats = []
+    input_list = []
+    for i, f in enumerate(enc_feats):
+        if not isinstance(f, torch.Tensor):
+            raise RuntimeError(f"Encoder feature {i} is not a Tensor: {type(f)}")
+        shape = tuple(f.shape)
+        sample_feats.append(torch.randn(*shape))
+        input_list.append((f"input_{i}", shape))
+
+    with torch.no_grad():
+        traced_adapter = torch.jit.trace(adapter, tuple(sample_feats))
+        print("Converting decoder (adapter) to Relay IR...")
+        mod_dec, params_dec = relay.frontend.from_pytorch(traced_adapter, input_list)
+
+    if TUNE:
+        tune_network(mod_dec, params_dec, TARGET, f"decoder_{TUNE_LOG}")
+
+    print("Building decoder for TVM...")
+
+    # Apply tuning log if it exists
+    if os.path.exists(f"decoder_{TUNE_LOG}"):
+        print(f"Applying tuning log: decoder_{TUNE_LOG}")
+        with auto_scheduler.ApplyHistoryBest(f"decoder_{TUNE_LOG}"):
+            with tvm.transform.PassContext(
+                opt_level=OPT_LEVEL,
+                # Auto-Scheduler가 스케줄링을 담당하므로 수동 Unroll 패스 제거
+            ):
+                lib_dec = relay.build(mod_dec, target=TARGET, params=params_dec)
+    else:
+        with tvm.transform.PassContext(
+            opt_level=OPT_LEVEL,
+            config={
+                "tir.add_lower_pass": [
+                    (UNROLL_PHASE, ForceSmallLoopUnroll),
+                    (UNROLL_PHASE, tvm.tir.transform.UnrollLoop()),
+                ],
+            },
+            instruments=[CheckUnrollInstrument()],
+        ):
+            lib_dec = relay.build(mod_dec, target=TARGET, params=params_dec)
+
+    # dec_results = check_optimization_applied(lib_dec, "Decoder", OPT_LEVEL)
+    export_tvm_module(
+        lib_dec, f"decoder_deploy_{OPT_LEVEL}_unroll_{UNROLL_PHASE}", OUTDIR, TARGET
+    )
+
+    print("\n✅ Done. Files are in:", OUTDIR)
 
 
-mode = try_call_decoder(decoder, enc_feats)
-
-
-class DecoderAdapter(torch.nn.Module):
-    def __init__(self, dec, mode):
-        super().__init__()
-        self.dec = dec
-        self.mode = mode
-
-    def forward(self, *feats):
-        if self.mode == "varargs":
-            return self.dec(*feats)
-        else:  # "list"
-            return self.dec(list(feats))
-
-
-adapter = DecoderAdapter(decoder, mode).eval()
-
-sample_feats = []
-input_list = []
-for i, f in enumerate(enc_feats):
-    if not isinstance(f, torch.Tensor):
-        raise RuntimeError(f"Encoder feature {i} is not a Tensor: {type(f)}")
-    shape = tuple(f.shape)
-    sample_feats.append(torch.randn(*shape))
-    input_list.append((f"input_{i}", shape))
-
-
-with torch.no_grad():
-    traced_adapter = torch.jit.trace(adapter, tuple(sample_feats))
-    print("Converting decoder (adapter) to Relay IR...")
-    mod_dec, params_dec = relay.frontend.from_pytorch(traced_adapter, input_list)
-
-print("Building decoder for TVM...")
-
-with tvm.transform.PassContext(
-    opt_level=OPT_LEVEL,
-    config={
-        "tir.add_lower_pass": [
-            (UNROLL_PHASE, ForceSmallLoopUnroll),
-            (UNROLL_PHASE, tvm.tir.transform.UnrollLoop()),
-        ],
-    },
-    instruments=[CheckUnrollInstrument()],
-):
-    lib_dec = relay.build(mod_dec, target=TARGET, params=params_dec)
-
-# dec_results = check_optimization_applied(lib_dec, "Decoder", OPT_LEVEL)
-export_tvm_module(lib_dec, f"decoder_deploy_{OPT_LEVEL}_unroll_{UNROLL_PHASE}")
-
-
-print("\n✅ Done. Files are in:", OUTDIR)
+if __name__ == "__main__":
+    main()
